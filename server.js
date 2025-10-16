@@ -615,7 +615,7 @@ const startServer = async () => {
   try {
     await connectDB();
     app.listen(PORT, () => {
-      console.log(`🚀 Server running on port ${PORT}`);
+      console.log(`🚀 updated Server running on port ${PORT}`);
       console.log(`📍 Health: http://localhost:${PORT}/health`);
       console.log(`🔐 Login: POST http://localhost:${PORT}/api/auth/login`);
       console.log(`📊 Sync Loans: POST http://localhost:${PORT}/api/loans/sync`);
