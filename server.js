@@ -273,6 +273,13 @@ app.post('/api/loans/sync', authenticateToken, async (req, res) => {
     let updated = 0;
 
     for (const loanData of loans) {
+      // Compute amountReceived from partialRepayments (exclude negative top-ups)
+      const pr = Array.isArray(loanData.partialRepayments)
+        ? loanData.partialRepayments
+        : [];
+      const computedReceived = pr
+        .filter(e => Number(e?.amount || 0) > 0)
+        .reduce((s, e) => s + Number(e.amount), 0);
       const existingLoan = await Loan.findOne({
         userId: req.userId,
         loanId: loanData.loanId
@@ -283,6 +290,7 @@ app.post('/api/loans/sync', authenticateToken, async (req, res) => {
         Object.assign(existingLoan, {
           ...loanData,
           userId: req.userId,
+          amountReceived: computedReceived,
           updatedAt: new Date()
         });
         await existingLoan.save();
@@ -292,6 +300,7 @@ app.post('/api/loans/sync', authenticateToken, async (req, res) => {
         const newLoan = new Loan({
           ...loanData,
           userId: req.userId,
+          amountReceived: computedReceived,
           createdAt: new Date(),
           updatedAt: new Date()
         });
@@ -309,7 +318,6 @@ app.post('/api/loans/sync', authenticateToken, async (req, res) => {
       depositsCount: 0
     }).save();
 
-    // Update user last sync
     req.user.lastSync = new Date();
     await req.user.save();
 
@@ -338,102 +346,102 @@ app.get('/api/loans', authenticateToken, async (req, res) => {
 
     const loans = await Loan.find(query).select('-__v').lean();
 
+    // Enrich with derived fields so clients always see correct due/principal
+    const enriched = loans.map((loan) => {
+      try {
+        const asOf = new Date();
+        const dailyRate = (loan.interestRate || 0) / 365 / 100;
+        let principal = Number(loan.amountGiven || 0);
+        let accrued = 0;
+        let interestPaid = 0;
+        let extraInterestPaid = 0;
+
+        const events = Array.isArray(loan.partialRepayments)
+          ? [...loan.partialRepayments]
+              .filter(e => e && e.date)
+              .sort((a, b) => new Date(a.date) - new Date(b.date))
+          : [];
+
+        let lastDate = new Date(loan.date);
+        for (const ev of events) {
+          const evDate = new Date(ev.date);
+          const days = Math.max(0, Math.floor((evDate - lastDate) / (1000 * 60 * 60 * 24)));
+          if (days > 0 && principal > 0) {
+            accrued += (principal * dailyRate * days);
+          }
+
+          let payment = Number(ev.amount || 0);
+          if (payment < 0) {
+            // top-up increases principal
+            principal += (-payment);
+            payment = 0;
+          } else if (payment > 0) {
+            const interestPortion = Math.min(payment, accrued);
+            accrued -= interestPortion;
+            interestPaid += interestPortion;
+            payment -= interestPortion;
+
+            if (payment > 0) {
+              const principalPortion = Math.min(payment, principal);
+              principal -= principalPortion;
+              payment -= principalPortion;
+            }
+
+            if (payment > 0) {
+              extraInterestPaid += payment;
+            }
+          }
+          lastDate = evDate;
+        }
+
+        const tailDays = Math.max(0, Math.floor((asOf - lastDate) / (1000 * 60 * 60 * 24)));
+        if (tailDays > 0 && principal > 0) {
+          accrued += (principal * dailyRate * tailDays);
+        }
+
+        // Enforce 30-day minimum interest for settlement-now view
+        const daysSinceStart = Math.max(0, Math.floor((asOf - new Date(loan.date)) / (1000 * 60 * 60 * 24)));
+        if (daysSinceStart < 30) {
+          const minInterest = (Number(loan.amountGiven || 0) * dailyRate * 30);
+          const paidSoFar = interestPaid + extraInterestPaid + accrued;
+          if (minInterest > paidSoFar) {
+            accrued += (minInterest - paidSoFar);
+          }
+        }
+
+        const amountReceived = events
+          .filter(e => Number(e.amount || 0) > 0)
+          .reduce((s, e) => s + Number(e.amount), 0);
+
+        const dueAmount = principal + accrued;
+
+        return {
+          ...loan,
+          amountReceived,
+          remainingPrincipal: principal,
+          dueAmount
+        };
+      } catch (_) {
+        return {
+          ...loan,
+          remainingPrincipal: loan.amountGiven,
+          dueAmount: loan.amountGiven
+        };
+      }
+    });
+
     res.json({
       success: true,
       message: 'Loans retrieved successfully',
       data: {
-        loans,
-        count: loans.length,
+        loans: enriched,
+        count: enriched.length,
         serverTime: new Date().toISOString()
       }
     });
   } catch (error) {
     console.error('Get loans error:', error);
     res.status(500).json({ success: false, message: 'Failed to retrieve loans' });
-  }
-});
-
-// Delete Loan
-app.delete('/api/loans/:loanId', authenticateToken, async (req, res) => {
-  try {
-    const { loanId } = req.params;
-
-    const loan = await Loan.findOne({ userId: req.userId, loanId });
-    if (!loan) {
-      return res.status(404).json({ success: false, message: 'Loan not found' });
-    }
-
-    loan.isDeleted = true;
-    loan.updatedAt = new Date();
-    await loan.save();
-
-    res.json({ success: true, message: 'Loan deleted successfully' });
-  } catch (error) {
-    console.error('Delete loan error:', error);
-    res.status(500).json({ success: false, message: 'Failed to delete loan' });
-  }
-});
-
-// ==================== DEPOSIT ROUTES ====================
-
-// Sync Deposits
-app.post('/api/deposits/sync', authenticateToken, async (req, res) => {
-  try {
-    const { deposits, deviceId } = req.body;
-
-    if (!Array.isArray(deposits)) {
-      return res.status(400).json({ success: false, message: 'Deposits must be an array' });
-    }
-
-    let created = 0;
-    let updated = 0;
-
-    for (const depositData of deposits) {
-      const existingDeposit = await Deposit.findOne({
-        userId: req.userId,
-        depositId: depositData.depositId
-      });
-
-      if (existingDeposit) {
-        Object.assign(existingDeposit, {
-          ...depositData,
-          userId: req.userId,
-          updatedAt: new Date()
-        });
-        await existingDeposit.save();
-        updated++;
-      } else {
-        const newDeposit = new Deposit({
-          ...depositData,
-          userId: req.userId,
-          createdAt: new Date(),
-          updatedAt: new Date()
-        });
-        await newDeposit.save();
-        created++;
-      }
-    }
-
-    // Log sync
-    await new SyncLog({
-      userId: req.userId,
-      deviceId,
-      syncType: 'incremental',
-      loansCount: 0,
-      depositsCount: deposits.length
-    }).save();
-
-    req.user.lastSync = new Date();
-    await req.user.save();
-
-    res.json({
-      success: true,
-      message: 'Deposits synced successfully',
-      data: { created, updated, total: deposits.length }
-    });
-  } catch (error) {
-    console.error('Deposit sync error:', error);
-    res.status(500).json({ success: false, message: 'Failed to sync deposits' });
   }
 });
 
@@ -449,13 +457,33 @@ app.get('/api/deposits', authenticateToken, async (req, res) => {
     }
 
     const deposits = await Deposit.find(query).select('-__v').lean();
+    const enriched = deposits.map(d => {
+      let currentBalance = 0;
+      try {
+        if (Array.isArray(d.transactions) && d.transactions.length) {
+          // Prefer last recorded balanceAfter if available
+          const sorted = [...d.transactions].sort((a,b) => new Date(a.dateAD || 0) - new Date(b.dateAD || 0));
+          const last = sorted[sorted.length - 1];
+          if (typeof last.balanceAfter === 'number') {
+            currentBalance = last.balanceAfter;
+          } else {
+            currentBalance = sorted.reduce((bal, t) => {
+              if (t.type === 'Deposit') return bal + Number(t.amount || 0);
+              if (t.type === 'Withdrawal') return bal - Number(t.amount || 0);
+              return bal;
+            }, 0);
+          }
+        }
+      } catch(_) {}
+      return { ...d, currentBalance };
+    });
 
     res.json({
       success: true,
       message: 'Deposits retrieved successfully',
       data: {
-        deposits,
-        count: deposits.length,
+        deposits: enriched,
+        count: enriched.length,
         serverTime: new Date().toISOString()
       }
     });
@@ -465,6 +493,7 @@ app.get('/api/deposits', authenticateToken, async (req, res) => {
   }
 });
 
+// ... (rest of the code remains the same)
 // ==================== BACKUP ROUTES ====================
 
 // Full Backup (for manual backup or restore)
